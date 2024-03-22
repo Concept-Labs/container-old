@@ -1,0 +1,299 @@
+<?php
+declare(strict_types=1);
+namespace Cl\Container\Iterator\Prioritized;
+
+use Cl\Container\Iterator\ContainerIteratorInterface;
+use Cl\EventDispatcher\ListenerProvider\Exception\InvalidArgumentException;
+use Psr\Log\LoggerInterface;
+use Psr\SimpleCache\CacheInterface;
+
+use Traversable;
+use ArrayIterator;
+
+final class PrioritizedTaggedContainer implements PrioritizedTaggedContainerInterface
+{
+
+    /**
+     * @var array<string, PrioritizedContainerInterface> $container 
+     *      Container, organized by tag and priority
+     */
+    protected array $container = [];
+    protected array $map = [];
+
+    /**
+     * @var array Hashes storage
+     */
+    protected $hashes = [];
+
+    protected static $uniq = 0;
+
+    /**
+     * @var integer An items counter
+     */
+    protected $counter = 0;
+
+    protected ?CacheInterface $cache = null;
+    protected ?LoggerInterface $logger = null;
+
+    public function __construct(?CacheInterface $cache = null, ?LoggerInterface $logger = null)
+    {
+        $this->cache = $cache;
+        $this->logger = $logger;
+    }
+
+    /**
+     * Attach an item to the container
+     *
+     * @param mixed    $item     The item to attach
+     * @param int      $priority The priority of the item
+     * @param string[] $tags     The tags of the item
+     *
+     * @return void
+     */
+    public function attach(mixed $item, ?array $tags = [], int $priority = null): int|string
+    {
+        $priority = $priority ?? PrioritizedContainerInterface::DEFAULT_PRIORITY;
+        /**
+         * Validate tags
+         */
+        $this->assertTags($tags);
+
+        /**
+         * Store in container. Nex manipulations will be with map based on static::$uniq
+         */
+        $this->container[++static::$uniq] = $item;
+        
+        foreach ($tags as $tag) {
+            if (!$this->has($tag)) {
+                /**
+                 * Create a container for the tag
+                 */
+                $this->map[$tag] = new PrioritizedContainer();
+            }
+            /**
+             * Attach the item
+             */
+            $this->hashes[$tag][] = //no need
+            ($this->map[$tag])->attach(static::$uniq, $priority);
+        }
+        $this->counter++;
+    }
+
+    /**
+     * Retrieves items based on the provided tag.
+     *
+     * @param string|array|null $tag The tag to retrieve items for:
+     *   - If a string is provided, it returns items for that specific tag.
+     *   - If an array is provided, it returns multiple items. See @see getMultiple().
+     *   - If null, it returns all items. See @see getMultiple().
+     * 
+     * @return \Generator
+     * @throws InvalidArgumentException
+     */
+    public function get(string|array $tag = null, bool $preserve_keys = true): Traversable
+    {
+        $tag = is_string($tag) ? [$tag] : (null !== $tag ? $tag : []);
+        yield from $this->getMultiple($tag, $preserve_keys);
+    }
+
+    /**
+     * Check if the container has an container for a specific tag
+     *
+     * @param string $tag The tag to check
+     *
+     * @return bool True if the container has an container for the tag, false otherwise
+     * @throws InvalidArgumentException
+     */
+    public function has(string $tag): bool
+    {
+        return 
+            !empty($this->map[$tag]) 
+            && $this->map[$tag] instanceof PrioritizedContainerInterface
+            ;
+    }
+
+    /**
+     * Get Multiple items for given tags
+     * If the tag is null than get items for all tags
+     * 
+     * @return iterable<string|int, mixed>
+     * @throws InvalidArgumentException
+     */
+    public function getMultiple(array $tags = [], $preserve_keys = true): iterable
+    {
+        
+        if (empty($tags)) {
+            /**
+             * Use all known tags
+             */
+            $tags = array_keys($this->map);
+        }
+
+        $this->assertTags($tags);
+
+        $ids = [];
+        foreach ($tags as $tag) {
+            if ($this->has($tag)) {
+                /**
+                 * Keys are concatenated values of priorities 
+                 *  and the unique value. See @see static::uniq.
+                 */
+                $ids += iterator_to_array($this->map[$tag]->get(), true);
+            }
+        }
+
+        /**
+         * Ids was received from couple of tags so must be resorted by priority
+         */
+        krsort($ids);
+
+        /**
+         * Remove duplicated ids.
+         * Duplicate appears because same items can be mapped to different tags
+         * Iem with higher priority will be kept
+         */
+        $ids = array_unique($ids);
+
+        /**
+         * Loop throw found ids
+         */
+        foreach ($ids as $priority => $id) {
+            /**
+             *  Get the item
+             */
+            $item = $this->container[$id];
+            /**
+             * Preserve key equals priority or not
+             */
+            match ($preserve_keys) {
+                true => yield $priority => $item,
+                default => yield $item,
+            };
+        }
+
+    }
+
+    /**
+     * Get Multiple items from the container grouped by tags
+     * If the tag array is empty than get All items from the container
+     * The return iterable after converting to array will looks:
+     * 
+     * array<string, array<int|string, mixed>> :
+     * 
+     * array [
+     *  'tag1' => [...items],
+     *  ...
+     * ]
+     * 
+     * An items inside each "tag" section are sorted 
+     * by priority and by attached turn if same priority
+     * 
+     * @param array<string> $tag The tags
+     * 
+     * @return iterable<array<string, array<mixed>>>
+     * @throws InvalidArgumentException
+     */
+    public function getMultipleGrouped(array $tags = [], $preserve_keys = true): iterable
+    {
+        if (empty($tags)) {
+            /**
+             * Use all known tags
+             */
+            $tags = array_keys($this->map);
+        }
+
+        $this->assertTags($tags);
+
+        $grouped = [];
+        foreach ($tags as $tag) {
+
+            if ($this->has($tag)) {
+
+                $grouped[$tag] = [];
+
+                foreach ($this->map[$tag]->get() as $priority => $id) {
+
+                    $value = $this->container[$id];
+
+                    match ($preserve_keys) {
+                        true => $grouped[$tag][$priority] = $value,
+                        default => $grouped[$tag][] = $value,
+                    };
+                }
+            }
+        };
+
+        return new ArrayIterator($grouped);
+    }
+
+    /**
+     * @see getMultiple()
+     *
+     * @return \Generator
+     */
+    public function getIterator(): Traversable
+    {
+        yield from $this->getMultiple();
+    }
+
+    /**
+     * Get the raw container
+     *
+     * @return array<string, ContainerIteratorInterface>
+     */
+    public function getContainerRaw(): array
+    {
+        return $this->container;
+    }
+
+    /**
+     * Count the number of items in the container.
+     *
+     * If a specific tag is provided, count the number of items associated with that tag.
+     * Otherwise, count all items in the container.
+     *
+     * @param string|null $tag The tag to filter items by.
+     *
+     * @return int The number of items in the container.
+     */
+    public function count(?string $tag = null)
+    {
+        return match ($tag !== null) {
+            true => count($this->hashes[$tag]),
+            default => $this->counter,
+        };
+    }
+
+    /**
+     * Reset
+     *
+     * @return void
+     */
+    public function reset(): void
+    {
+        $this->container = [];
+        $this->hashes = [];
+        $this->counter = 0;
+    }
+
+    /**
+     * Check the tags are sting
+     *
+     * @param array $tags 
+     * 
+     * @return void
+     * @throws InvalidArgumentException if a tags contains not string
+     */
+    protected function assertTags(array &$tags = []): void
+    {
+
+        if (empty($tags) 
+            || count(
+                array_filter($tags, fn ($value) => is_string($value) || ($value instanceof \Stringable))
+            ) !== count($tags)
+        ) {
+            throw new InvalidArgumentException(_("Tags must not empty and must be strings"));
+        }
+    }
+
+}
